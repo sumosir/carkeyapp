@@ -1,0 +1,27 @@
+workflows:
+  ios-build:
+    name: iOS Build (无签名 IPA)
+    max_build_duration: 30
+    environment:
+      flutter: stable
+      xcode: latest
+      cocoapods: default
+    scripts:
+      - name: 安装依赖
+        script: flutter pub get
+      - name: 构建 iOS（无签名）
+        script: |
+          flutter build ios --release --no-codesign
+      - name: 打包 IPA
+        script: |
+          cd build/ios/iphoneos
+          mkdir -p Payload
+          cp -r Runner.app Payload/
+          zip -qr app.ipa Payload
+          echo "IPA 打包完成: $(pwd)/app.ipa"
+    artifacts:
+      - build/ios/iphoneos/app.ipa
+    publishing:
+      email:
+        recipients:
+          - your-email@example.com

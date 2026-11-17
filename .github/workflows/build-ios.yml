@@ -1,0 +1,36 @@
+name: Build iOS IPA
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build-ios:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+
+      - name: 安装依赖
+        run: flutter pub get
+
+      - name: 构建 iOS（无签名）
+        run: flutter build ios --release --no-codesign
+
+      - name: 打包 IPA
+        run: |
+          cd build/ios/iphoneos
+          mkdir -p Payload
+          cp -r Runner.app Payload/
+          zip -qr car_key.ipa Payload
+
+      - name: 上传 IPA 产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: car-key-ipa
+          path: build/ios/iphoneos/car_key.ipa
