@@ -78,6 +78,10 @@ class _CarKeyHomePageState extends State<CarKeyHomePage>
   int _reconnectAttempts = 0;
   bool _sawTarget = false;
 
+  /// 车辆锁止状态（与蓝牙连接状态解耦）
+  /// 连接成功会自动解锁 → false；手动上锁或断开 → true
+  bool _locked = true;
+
   Timer? _reconnectTimer;
   StreamSubscription<List<ScanResult>>? _scanSubscription;
   StreamSubscription<BluetoothConnectionState>? _connSubscription;
@@ -208,6 +212,7 @@ class _CarKeyHomePageState extends State<CarKeyHomePage>
         _hint = null;
         _found.clear();
         _sawTarget = false;
+        _locked = true;   // 未连接时车辆处于上锁状态
       });
     }
 
@@ -395,6 +400,7 @@ class _CarKeyHomePageState extends State<CarKeyHomePage>
     if (!mounted) return;
     setState(() {
       _state = ConnState.connected;
+      _locked = false;                    // 连上后固件会自动解锁
       _statusText = '车辆已解锁';
       _hint = _controlChar == null ? '未找到控制特征，手动按钮可能不可用' : null;
     });
@@ -407,6 +413,7 @@ class _CarKeyHomePageState extends State<CarKeyHomePage>
     if (!mounted) return;
     setState(() {
       _state = ConnState.disconnected;
+      _locked = true;                     // 断开后固件会延时上锁
       _statusText = '已断开，车辆上锁';
       _rssi = null;
     });
@@ -459,7 +466,8 @@ class _CarKeyHomePageState extends State<CarKeyHomePage>
       await _controlChar!.write([cmd], withoutResponse: true);
       if (mounted) {
         setState(() {
-          _statusText = cmd == _cmdUnlock ? '已手动解锁' : '已手动上锁';
+          _locked = cmd == _cmdLock;
+          _statusText = _locked ? '车辆已上锁' : '车辆已解锁';
         });
       }
     } catch (e) {
@@ -513,6 +521,7 @@ class _CarKeyHomePageState extends State<CarKeyHomePage>
     } catch (_) {}
     _device = null;
     _controlChar = null;
+    _locked = true;
     _reconnectAttempts = 0;
 
     await _restartScan();
@@ -592,33 +601,28 @@ class _CarKeyHomePageState extends State<CarKeyHomePage>
   // ==================== UI ====================
 
   /// 根据状态返回背景渐变色
+  /// 上锁 = 红色，解锁 = 绿色，搜索/连接 = 蓝色，待机 = 深灰
   List<Color> get _bgColors {
-    switch (_state) {
-      case ConnState.connected:
-        return const [Color(0xFF0E7C5A), Color(0xFF052B22), Color(0xFF000000)];
-      case ConnState.connecting:
-      case ConnState.scanning:
-        return const [Color(0xFF14406E), Color(0xFF071B2E), Color(0xFF000000)];
-      case ConnState.disconnected:
-        return const [Color(0xFF7A1F1F), Color(0xFF2A0A0A), Color(0xFF000000)];
-      default:
-        return const [Color(0xFF2A2F36), Color(0xFF101316), Color(0xFF000000)];
+    if (_state == ConnState.scanning || _state == ConnState.connecting) {
+      return const [Color(0xFF14406E), Color(0xFF071B2E), Color(0xFF000000)];
     }
+    if (_state == ConnState.connected || _state == ConnState.disconnected) {
+      return _locked
+          ? const [Color(0xFFC62828), Color(0xFF4A0B0B), Color(0xFF000000)]
+          : const [Color(0xFF0E7C5A), Color(0xFF052B22), Color(0xFF000000)];
+    }
+    return const [Color(0xFF2A2F36), Color(0xFF101316), Color(0xFF000000)];
   }
 
   /// 主色：解锁绿 / 上锁红 / 过程蓝
   Color get _accent {
-    switch (_state) {
-      case ConnState.connected:
-        return const Color(0xFF3DDC97);
-      case ConnState.scanning:
-      case ConnState.connecting:
-        return const Color(0xFF4EA8FF);
-      case ConnState.disconnected:
-        return const Color(0xFFFF6B6B);
-      default:
-        return Colors.white70;
+    if (_state == ConnState.scanning || _state == ConnState.connecting) {
+      return const Color(0xFF4EA8FF);
     }
+    if (_state == ConnState.connected || _state == ConnState.disconnected) {
+      return _locked ? const Color(0xFFFF5252) : const Color(0xFF3DDC97);
+    }
+    return Colors.white70;
   }
 
   bool get _isConnected => _state == ConnState.connected;
@@ -761,23 +765,32 @@ class _CarKeyHomePageState extends State<CarKeyHomePage>
 
   /// 车锁图标 + 呼吸光晕
   Widget _buildLockVisual() {
-    final busy = _state == ConnState.scanning || _state == ConnState.connecting;
+    final busy = _state == ConnState.scanning ||
+        _state == ConnState.connecting ||
+        _isBusy;
 
     return AnimatedBuilder(
       animation: _pulse,
       builder: (context, child) {
         final t = busy ? _pulse.value : 0.0;
         final scale = 1.0 + t * 0.06;
-        final glow = busy ? 0.25 + t * 0.35 : 0.35;
+        final glow = busy ? 0.25 + t * 0.35 : 0.4;
 
-        return Container(
+        return AnimatedContainer(
+          duration: const Duration(milliseconds: 500),
+          curve: Curves.easeInOut,
           width: 170,
           height: 170,
           decoration: BoxDecoration(
             shape: BoxShape.circle,
+            color: _accent.withValues(alpha: 0.10),
+            border: Border.all(
+              color: _accent.withValues(alpha: 0.30),
+              width: 2,
+            ),
             boxShadow: [
               BoxShadow(
-                color: _accent.withValues(alpha: glow * 0.45),
+                color: _accent.withValues(alpha: glow * 0.5),
                 blurRadius: 60 + t * 40,
                 spreadRadius: 6,
               ),
@@ -792,16 +805,35 @@ class _CarKeyHomePageState extends State<CarKeyHomePage>
         );
       },
       child: AnimatedSwitcher(
-        duration: const Duration(milliseconds: 450),
-        transitionBuilder: (child, animation) => ScaleTransition(
-          scale: CurvedAnimation(parent: animation, curve: Curves.easeOutBack),
-          child: FadeTransition(opacity: animation, child: child),
-        ),
+        duration: const Duration(milliseconds: 550),
+        switchInCurve: Curves.easeOutBack,
+        switchOutCurve: Curves.easeIn,
+        transitionBuilder: (child, animation) {
+          final curved =
+              CurvedAnimation(parent: animation, curve: Curves.easeOutBack);
+          return FadeTransition(
+            opacity: animation,
+            child: ScaleTransition(
+              scale: Tween<double>(begin: 0.45, end: 1.0).animate(curved),
+              child: RotationTransition(
+                // 上锁顺时针、解锁逆时针转进来，动作更有仪式感
+                turns: Tween<double>(
+                  begin: _locked ? 0.14 : -0.14,
+                  end: 0.0,
+                ).animate(curved),
+                child: child,
+              ),
+            ),
+          );
+        },
         child: Icon(
-          _isConnected ? Icons.lock_open_rounded : Icons.lock_rounded,
-          key: ValueKey(_isConnected),
-          size: 110,
+          _locked ? Icons.lock_rounded : Icons.lock_open_rounded,
+          key: ValueKey<bool>(_locked),
+          size: 100,
           color: _accent,
+          shadows: [
+            Shadow(color: _accent.withValues(alpha: 0.7), blurRadius: 24),
+          ],
         ),
       ),
     );
