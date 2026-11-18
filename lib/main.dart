@@ -1,4 +1,4 @@
-import 'dart:async';
+﻿import 'dart:async';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
@@ -19,12 +19,6 @@ const int _cmdClearBond = 0x02;
 
 /// SharedPreferences 中保存已绑定设备 ID 的键
 const String _prefBoundDevice = 'bound_device_id';
-
-/// 重连间隔（毫秒）
-const int _reconnectIntervalMs = 3000;
-
-/// 连续重连失败次数上限，超过则回到扫描
-const int _maxReconnectAttempts = 3;
 
 /// 单次扫描时长（秒）
 const int _scanSeconds = 20;
@@ -75,14 +69,13 @@ class _CarKeyHomePageState extends State<CarKeyHomePage>
   String? _boundDeviceId;
   final Map<String, ScanResult> _found = {};
   bool _connecting = false;
-  int _reconnectAttempts = 0;
-  bool _sawTarget = false;
 
   /// 车辆锁止状态（与蓝牙连接状态解耦）
   /// 连接成功会自动解锁 → false；手动上锁或断开 → true
   bool _locked = true;
 
   Timer? _reconnectTimer;
+  Timer? _autoRetryTimer;
   StreamSubscription<List<ScanResult>>? _scanSubscription;
   StreamSubscription<BluetoothConnectionState>? _connSubscription;
 
@@ -103,6 +96,7 @@ class _CarKeyHomePageState extends State<CarKeyHomePage>
   void dispose() {
     _pulse.dispose();
     _reconnectTimer?.cancel();
+    _autoRetryTimer?.cancel();
     _scanSubscription?.cancel();
     _connSubscription?.cancel();
     super.dispose();
@@ -171,6 +165,11 @@ class _CarKeyHomePageState extends State<CarKeyHomePage>
         _hint = '手机蓝牙未开启，请打开蓝牙';
         _statusText = '蓝牙未开启';
       });
+      /* 自动轮询，用户打开蓝牙后无需任何操作即可连接 */
+      _autoRetryTimer?.cancel();
+      _autoRetryTimer = Timer(const Duration(seconds: 3), () {
+        if (mounted) _ensureAdapterAndScan();
+      });
       return;
     }
 
@@ -204,6 +203,8 @@ class _CarKeyHomePageState extends State<CarKeyHomePage>
         _state == ConnState.connected) {
       return;
     }
+    _reconnectTimer?.cancel();
+    _autoRetryTimer?.cancel();
 
     if (mounted) {
       setState(() {
@@ -211,7 +212,6 @@ class _CarKeyHomePageState extends State<CarKeyHomePage>
         _statusText = _boundDeviceId == null ? '正在搜索 CarKey...' : '正在寻找已绑定的设备...';
         _hint = null;
         _found.clear();
-        _sawTarget = false;
         _locked = true;   // 未连接时车辆处于上锁状态
       });
     }
@@ -231,9 +231,7 @@ class _CarKeyHomePageState extends State<CarKeyHomePage>
       for (final r in results) {
         final id = r.device.remoteId.str;
         final isBound = _boundDeviceId != null && id == _boundDeviceId;
-        final isTarget = _isTarget(r);
-        if (isTarget) _sawTarget = true;
-        if (isBound || isTarget) {
+        if (isBound || _isTarget(r)) {
           _connectToDevice(r.device);
           return;
         }
@@ -258,23 +256,27 @@ class _CarKeyHomePageState extends State<CarKeyHomePage>
     }
 
     if (mounted && _state == ConnState.scanning) {
+      /* 扫完一轮没连上就自动再扫，保持「靠近即自动连接」 */
       setState(() {
         _state = ConnState.idle;
-        _statusText = _sawTarget ? '已发现 CarKey，但未连上' : '未发现 CarKey';
-        if (_sawTarget) {
-          _hint = '已发现 CarKey 但连接失败\n'
-              '1. 确认没有其他手机连着它（开发板只支持 1 个连接）\n'
-              '2. 若换过固件，请到设置里「清除配对记录」后重试';
-        } else if (_found.isEmpty) {
-          _hint = '没有扫描到任何蓝牙设备\n'
-              '1. 确认手机蓝牙已开启\n'
-              '2. 确认开发板已通电';
-        } else {
-          _hint = '已发现 ${_found.length} 个其他蓝牙设备，但没有 CarKey\n'
-              '开发板可能已被其他手机占用连接（此时会停止广播）';
-        }
+        _statusText = '等待车辆靠近...';
+        _hint = null;
       });
+      _scheduleAutoScan();
     }
+  }
+
+  /// 扫描结束后自动开始下一轮，无需用户手动点「重新搜索」
+  void _scheduleAutoScan() {
+    _autoRetryTimer?.cancel();
+    _autoRetryTimer = Timer(const Duration(seconds: 2), () {
+      if (!mounted) return;
+      if (_state == ConnState.connected ||
+          _state == ConnState.connecting) {
+        return;
+      }
+      _startScan();
+    });
   }
 
   // ==================== 连接 ====================
@@ -319,19 +321,18 @@ class _CarKeyHomePageState extends State<CarKeyHomePage>
       }
 
       if (ok) {
-        _reconnectAttempts = 0;
         return;
       }
 
-      _reconnectAttempts++;
+      /* 连接失败不打断用户，直接回到扫描，靠近时会再次自动尝试 */
       if (mounted) {
         setState(() {
           _state = ConnState.idle;
-          _statusText = '连接失败';
+          _statusText = '等待车辆靠近...';
           _hint = null;
         });
       }
-      await _showConnectFailedDialog();
+      _toast('连接失败，正在自动重试...');
       _scheduleReconnect();
     } finally {
       _connecting = false;
@@ -351,31 +352,10 @@ class _CarKeyHomePageState extends State<CarKeyHomePage>
     }
   }
 
-  Future<void> _showConnectFailedDialog() async {
-    if (!mounted) return;
-    await showDialog<void>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('连接失败'),
-        content: const Text(
-          '1. 确认没有其他手机连着 CarKey（开发板只支持 1 个连接）\n\n'
-          '2. 若换过固件，到设置里点「清除配对记录」，然后重新搜索\n\n'
-          '3. 关掉手机蓝牙再打开，重新搜索',
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx),
-            child: const Text('知道了'),
-          ),
-        ],
-      ),
-    );
-  }
-
   Future<void> _onConnected() async {
     if (_state == ConnState.connected) return;
     _reconnectTimer?.cancel();
-    _reconnectAttempts = 0;
+    _autoRetryTimer?.cancel();
 
     if (_device != null) {
       await _saveBoundDevice(_device!.remoteId.str);
@@ -422,25 +402,17 @@ class _CarKeyHomePageState extends State<CarKeyHomePage>
 
   void _scheduleReconnect() {
     _reconnectTimer?.cancel();
-    _reconnectTimer = Timer(
-      const Duration(milliseconds: _reconnectIntervalMs),
-      () async {
-        if (!mounted) return;
-
-        if (_reconnectAttempts >= _maxReconnectAttempts) {
-          _reconnectAttempts = 0;
-          _device = null;
-          await _startScan();
-          return;
-        }
-
-        if (_device != null) {
-          await _connectToDevice(_device!, autoConnect: true);
-        } else {
-          await _startScan();
-        }
-      },
-    );
+    _reconnectTimer = Timer(const Duration(milliseconds: 1500), () {
+      if (!mounted) return;
+      if (_state == ConnState.connected ||
+          _state == ConnState.connecting) {
+        return;
+      }
+      /* 不复用旧设备对象：开发板可能换了地址或重启过，
+       * 重新扫描才能找到它并自动连上 */
+      _device = null;
+      _startScan();
+    });
   }
 
   Future<void> _readRssi() async {
@@ -522,7 +494,6 @@ class _CarKeyHomePageState extends State<CarKeyHomePage>
     _device = null;
     _controlChar = null;
     _locked = true;
-    _reconnectAttempts = 0;
 
     await _restartScan();
     _toast('已清除配对记录，请重新配对（配对码 299450）');
@@ -555,6 +526,7 @@ class _CarKeyHomePageState extends State<CarKeyHomePage>
 
   Future<void> _restartScan() async {
     _reconnectTimer?.cancel();
+    _autoRetryTimer?.cancel();
     await _scanSubscription?.cancel();
     _scanSubscription = null;
     try {
@@ -565,7 +537,6 @@ class _CarKeyHomePageState extends State<CarKeyHomePage>
     } catch (_) {}
     _controlChar = null;
     _device = null;
-    _reconnectAttempts = 0;
     if (mounted) setState(() => _state = ConnState.idle);
     await _ensureAdapterAndScan();
   }
@@ -759,7 +730,7 @@ class _CarKeyHomePageState extends State<CarKeyHomePage>
       case ConnState.disconnected:
         return '等待自动重连...';
       default:
-        return '下拉刷新或到设置里重新搜索';
+        return '保持蓝牙开启，靠近车辆自动连接';
     }
   }
 
