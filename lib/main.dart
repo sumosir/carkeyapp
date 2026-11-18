@@ -64,6 +64,8 @@ class _CarKeyHomePageState extends State<CarKeyHomePage>
   BluetoothCharacteristic? _controlChar;
   /// 首次发现成功后缓存的特征对象，重连时直接复用
   BluetoothCharacteristic? _cachedChar;
+  /// 控制通道是否已通过真正的服务发现确认（false 时后台继续重试）
+  bool _channelReady = false;
   int? _rssi;
   String _statusText = '等待启动...';
   String? _hint;
@@ -80,6 +82,8 @@ class _CarKeyHomePageState extends State<CarKeyHomePage>
 
   Timer? _reconnectTimer;
   Timer? _autoRetryTimer;
+  Timer? _channelTimer;
+  int _channelFails = 0;
   StreamSubscription<List<ScanResult>>? _scanSubscription;
   StreamSubscription<BluetoothConnectionState>? _connSubscription;
 
@@ -101,6 +105,7 @@ class _CarKeyHomePageState extends State<CarKeyHomePage>
     _pulse.dispose();
     _reconnectTimer?.cancel();
     _autoRetryTimer?.cancel();
+    _channelTimer?.cancel();
     _scanSubscription?.cancel();
     _connSubscription?.cancel();
     super.dispose();
@@ -360,6 +365,7 @@ class _CarKeyHomePageState extends State<CarKeyHomePage>
     if (_state == ConnState.connected) return;
     _reconnectTimer?.cancel();
     _autoRetryTimer?.cancel();
+    _channelTimer?.cancel();
 
     if (_device != null) {
       await _saveBoundDevice(_device!.remoteId.str);
@@ -373,45 +379,97 @@ class _CarKeyHomePageState extends State<CarKeyHomePage>
       _hint = null;
     });
 
-    /* iOS 在重连后再次 discoverServices 往往不会再回调，因此优先复用
-     * 首次发现得到的特征对象；只有缓存为空时才重新发现 */
-    _controlChar = _cachedChar;
-    if (_controlChar == null) {
-      _controlChar = await _discoverControlChar();
-      _cachedChar = _controlChar;
-    }
+    /* 连接成功就立刻恢复界面，控制通道在后台补齐。
+     * 服务发现失败也不再断开重连，否则会陷入「重建通道」死循环 */
+    _readRssi();
+    _ensureControlChannel();
+  }
 
-    if (!mounted) return;
-    if (_controlChar == null) {
-      /* 服务发现拿不到特征时，断开重连一次，通常第二次就正常 */
-      setState(() => _hint = '正在重新建立控制通道...');
-      _toast('连接不完整，正在自动重连');
-      try {
-        await _device?.disconnect();
-      } catch (_) {}
-      _scheduleReconnect();
+  /// 找到（或重建）控制特征
+  ///
+  /// 顺序：本次会话缓存 → FlutterBluePlus 已缓存的 GATT 树 → 真正做一次服务发现。
+  /// 发现失败时只在后台悄悄重试，绝不断开连接。
+  Future<void> _ensureControlChannel() async {
+    if (!mounted || _state != ConnState.connected) return;
+    final device = _device;
+    if (device == null) return;
+
+    // 1. 复用之前发现过的特征对象：iOS 写入时是按 UUID 在系统缓存里查找的
+    final cached = _cachedChar ?? _findCachedChar(device);
+    if (cached != null) {
+      _controlChar = cached;
+      _cachedChar = cached;
+      _channelReady = true;
+      _channelFails = 0;
+      if (mounted) {
+        setState(() {
+          _hint = null;
+          _diag = null;
+        });
+      }
+      return;
+    }
+    if (_channelReady && _controlChar != null) return;
+
+    // 2. 真正做一次服务发现（内部会先等加密握手完成）
+    final found = await _discoverControlChar();
+    if (!mounted || _state != ConnState.connected) return;
+    if (found != null) {
+      _controlChar = found;
+      _cachedChar = found;
+      _channelReady = true;
+      _channelFails = 0;
+      setState(() {
+        _hint = null;
+        _diag = null;
+      });
       return;
     }
 
-    if (mounted) setState(() => _hint = null);
-    _readRssi();
+    // 3. 发现没成功：先按 UUID 构造等价特征让按钮可用，再后台重试发现
+    _controlChar = BluetoothCharacteristic(
+      remoteId: device.remoteId,
+      serviceUuid: _serviceUuid,
+      characteristicUuid: _controlCharUuid,
+    );
+    _channelFails++;
+    _scheduleChannelRetry();
+  }
+
+  /// 从 FlutterBluePlus 缓存的 GATT 树里找控制特征（不触发系统调用）
+  BluetoothCharacteristic? _findCachedChar(BluetoothDevice device) {
+    for (final service in device.servicesList) {
+      if (service.uuid != _serviceUuid) continue;
+      for (final c in service.characteristics) {
+        if (c.uuid == _controlCharUuid) return c;
+      }
+    }
+    return null;
+  }
+
+  /// 服务发现失败后隔几秒安静地重试，不打扰用户
+  void _scheduleChannelRetry() {
+    _channelTimer?.cancel();
+    if (_channelFails > 6) return;       // 重试太多次就不再刷，等用户手动操作时再试
+    _channelTimer = Timer(const Duration(seconds: 3), () {
+      if (!mounted || _state != ConnState.connected) return;
+      _ensureControlChannel();
+    });
   }
 
   /// 带重试地查找控制特征
   ///
-  /// iOS 在加密握手尚未完成时调用 discoverServices 会返回空列表，
-  /// 表现为「连上了但找不到控制特征、按钮不可用」。
-  /// 这里先等加密完成，再多试几次。
+  /// iOS 重连后会立刻开始加密握手，加密完成前做服务发现必然失败（回调都不回来），
+  /// 所以第一次要多等一会儿。
   Future<BluetoothCharacteristic?> _discoverControlChar() async {
     for (var attempt = 1; attempt <= 3; attempt++) {
-      await Future.delayed(Duration(milliseconds: attempt == 1 ? 700 : 600));
-      if (!mounted || _device == null) return null;
+      await Future.delayed(Duration(milliseconds: attempt == 1 ? 1500 : 800));
+      if (!mounted || _device == null || _state != ConnState.connected) {
+        return null;
+      }
 
       try {
-        final services = await _device!.discoverServices(
-          timeout: 6,
-          subscribeToServicesChanged: false,
-        );
+        final services = await _device!.discoverServices(timeout: 5);
         debugPrint('服务发现第 $attempt 次：${services.length} 个服务');
         if (mounted) {
           setState(() => _diag = '第 $attempt 次发现：${services.length} 个服务');
@@ -421,7 +479,6 @@ class _CarKeyHomePageState extends State<CarKeyHomePage>
           for (final c in service.characteristics) {
             if (c.uuid == _controlCharUuid) {
               debugPrint('已找到控制特征（第 $attempt 次）');
-              if (mounted) setState(() => _diag = null);
               return c;
             }
           }
@@ -437,7 +494,11 @@ class _CarKeyHomePageState extends State<CarKeyHomePage>
   }
 
   void _onDisconnected() {
+    _channelTimer?.cancel();
+    _channelFails = 0;
     _controlChar = null;
+    /* 注意：不清 _cachedChar / _channelReady，下次连接直接复用，
+     * 避免重连后再做一次可能失败的服务发现 */
     if (!mounted) return;
     setState(() {
       _state = ConnState.disconnected;
@@ -450,6 +511,7 @@ class _CarKeyHomePageState extends State<CarKeyHomePage>
 
   void _scheduleReconnect() {
     _reconnectTimer?.cancel();
+    _channelTimer?.cancel();
     _reconnectTimer = Timer(const Duration(milliseconds: 1500), () {
       if (!mounted) return;
       if (_state == ConnState.connected ||
@@ -476,33 +538,58 @@ class _CarKeyHomePageState extends State<CarKeyHomePage>
   // ==================== 控制 ====================
 
   Future<void> _sendCommand(int cmd) async {
-    if (_controlChar == null || _state != ConnState.connected) {
-      _toast('设备未连接，无法控制');
+    if (_state != ConnState.connected) {
+      _toast('设备未连接，正在自动重连');
+      _scheduleReconnect();
+      return;
+    }
+
+    // 通道还没准备好就先补一次，不直接拒绝用户
+    if (_controlChar == null) {
+      await _ensureControlChannel();
+    }
+    final chr = _controlChar;
+    if (chr == null) {
+      _toast('正在准备控制通道，请稍后再试');
       return;
     }
 
     setState(() => _isBusy = true);
-    try {
-      await _controlChar!.write([cmd], withoutResponse: true);
+    var ok = false;
+    Object? err;
+    for (var i = 0; i < 2 && !ok; i++) {
+      try {
+        await chr.write([cmd], withoutResponse: true);
+        ok = true;
+      } catch (e) {
+        /* iOS 偶发 canSendWriteWithoutResponse=false，稍等重试一次即可 */
+        err = e;
+        await Future.delayed(const Duration(milliseconds: 250));
+      }
+    }
+
+    if (ok) {
+      _channelReady = true;
       if (mounted) {
         setState(() {
           _locked = cmd == _cmdLock;
           _statusText = _locked ? '车辆已上锁' : '车辆已解锁';
         });
       }
-    } catch (e) {
-      /* 特征对象可能随连接失效，清掉缓存后重连一次 */
-      debugPrint('写入失败: $e');
+    } else {
+      /* 两次都失败才认为连接异常，清缓存重连 */
+      debugPrint('写入失败: $err');
       _cachedChar = null;
       _controlChar = null;
+      _channelReady = false;
+      _channelFails = 0;
       _toast('操作失败，正在重新连接...');
       try {
         await _device?.disconnect();
       } catch (_) {}
       _scheduleReconnect();
-    } finally {
-      if (mounted) setState(() => _isBusy = false);
     }
+    if (mounted) setState(() => _isBusy = false);
   }
 
   Future<void> _clearBond() async {
@@ -550,6 +637,9 @@ class _CarKeyHomePageState extends State<CarKeyHomePage>
     _device = null;
     _controlChar = null;
     _cachedChar = null;
+    _channelReady = false;
+    _channelFails = 0;
+    _channelTimer?.cancel();
     _locked = true;
 
     await _restartScan();
@@ -584,6 +674,8 @@ class _CarKeyHomePageState extends State<CarKeyHomePage>
   Future<void> _restartScan() async {
     _reconnectTimer?.cancel();
     _autoRetryTimer?.cancel();
+    _channelTimer?.cancel();
+    _channelFails = 0;
     await _scanSubscription?.cancel();
     _scanSubscription = null;
     try {
