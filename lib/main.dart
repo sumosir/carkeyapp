@@ -380,36 +380,29 @@ class _CarKeyHomePageState extends State<CarKeyHomePage>
     });
 
     /* 连接成功就立刻恢复界面，控制通道在后台补齐。
-     * 服务发现失败也不再断开重连，否则会陷入「重建通道」死循环 */
+     * 每次重连后 iOS 都会重建 CBPeripheral，原生 GATT 树是空的，
+     * 所以先用缓存让按钮可用，再安静地做一次服务发现。 */
+    final dev = _device;
+    if (dev != null) _controlChar = _cachedChar ?? _findCachedChar(dev);
+    _channelReady = false;
     _readRssi();
     _ensureControlChannel();
   }
 
   /// 找到（或重建）控制特征
   ///
-  /// 顺序：本次会话缓存 → FlutterBluePlus 已缓存的 GATT 树 → 真正做一次服务发现。
+  /// 每次连接都要重新确认一次：iOS 重连后会换一个新的 CBPeripheral，
+  /// 原生 GATT 树为空，写入会报 primary service not found。
   /// 发现失败时只在后台悄悄重试，绝不断开连接。
   Future<void> _ensureControlChannel() async {
     if (!mounted || _state != ConnState.connected) return;
     final device = _device;
     if (device == null) return;
 
-    // 1. 复用之前发现过的特征对象：iOS 写入时是按 UUID 在系统缓存里查找的
-    final cached = _cachedChar ?? _findCachedChar(device);
-    if (cached != null) {
-      _controlChar = cached;
-      _cachedChar = cached;
-      _channelReady = true;
-      _channelFails = 0;
-      if (mounted) {
-        setState(() {
-          _hint = null;
-          _diag = null;
-        });
-      }
-      return;
-    }
-    if (_channelReady && _controlChar != null) return;
+    // 1. 先用缓存的特征对象让按钮马上可用
+    _controlChar ??= _cachedChar ?? _findCachedChar(device);
+
+    if (_channelReady) return;
 
     // 2. 真正做一次服务发现（内部会先等加密握手完成）
     final found = await _discoverControlChar();
@@ -427,7 +420,7 @@ class _CarKeyHomePageState extends State<CarKeyHomePage>
     }
 
     // 3. 发现没成功：先按 UUID 构造等价特征让按钮可用，再后台重试发现
-    _controlChar = BluetoothCharacteristic(
+    _controlChar ??= BluetoothCharacteristic(
       remoteId: device.remoteId,
       serviceUuid: _serviceUuid,
       characteristicUuid: _controlCharUuid,
@@ -461,8 +454,8 @@ class _CarKeyHomePageState extends State<CarKeyHomePage>
   ///
   /// iOS 重连后会立刻开始加密握手，加密完成前做服务发现必然失败（回调都不回来），
   /// 所以第一次要多等一会儿。
-  Future<BluetoothCharacteristic?> _discoverControlChar() async {
-    for (var attempt = 1; attempt <= 3; attempt++) {
+  Future<BluetoothCharacteristic?> _discoverControlChar({int tries = 3}) async {
+    for (var attempt = 1; attempt <= tries; attempt++) {
       await Future.delayed(Duration(milliseconds: attempt == 1 ? 1500 : 800));
       if (!mounted || _device == null || _state != ConnState.connected) {
         return null;
@@ -497,8 +490,9 @@ class _CarKeyHomePageState extends State<CarKeyHomePage>
     _channelTimer?.cancel();
     _channelFails = 0;
     _controlChar = null;
-    /* 注意：不清 _cachedChar / _channelReady，下次连接直接复用，
-     * 避免重连后再做一次可能失败的服务发现 */
+    /* 保留 _cachedChar（重连后先让按钮可用），但本次连接的控制通道
+     * 需要重新做服务发现确认，所以 _channelReady 归零 */
+    _channelReady = false;
     if (!mounted) return;
     setState(() {
       _state = ConnState.disconnected;
@@ -555,16 +549,33 @@ class _CarKeyHomePageState extends State<CarKeyHomePage>
     }
 
     setState(() => _isBusy = true);
-    var ok = false;
+
     Object? err;
-    for (var i = 0; i < 2 && !ok; i++) {
-      try {
-        await chr.write([cmd], withoutResponse: true);
-        ok = true;
-      } catch (e) {
-        /* iOS 偶发 canSendWriteWithoutResponse=false，稍等重试一次即可 */
-        err = e;
-        await Future.delayed(const Duration(milliseconds: 250));
+    var ok = false;
+    try {
+      await _writeCommand(chr, cmd);
+      ok = true;
+    } catch (e) {
+      err = e;
+      debugPrint('写入失败第 1 次: $e');
+    }
+
+    /* 常见原因：iOS 重连后 GATT 树还没建立，写特征时会报
+     * primary service / characteristic not found。
+     * 这时补一次真正的服务发现，再写一次，不要直接重连 */
+    if (!ok && !_isSecurityError(err ?? '')) {
+      final fresh = await _discoverControlChar(tries: 2);
+      if (fresh != null) {
+        _controlChar = fresh;
+        _cachedChar = fresh;
+        _channelReady = true;
+        try {
+          await _writeCommand(fresh, cmd);
+          ok = true;
+        } catch (e) {
+          err = e;
+          debugPrint('写入失败第 2 次: $e');
+        }
       }
     }
 
@@ -577,8 +588,8 @@ class _CarKeyHomePageState extends State<CarKeyHomePage>
         });
       }
     } else {
-      /* 两次都失败才认为连接异常，清缓存重连 */
-      debugPrint('写入失败: $err');
+      /* 补发现后仍失败，才清缓存重连（重新加密） */
+      debugPrint('写入最终失败: $err');
       _cachedChar = null;
       _controlChar = null;
       _channelReady = false;
@@ -590,6 +601,26 @@ class _CarKeyHomePageState extends State<CarKeyHomePage>
       _scheduleReconnect();
     }
     if (mounted) setState(() => _isBusy = false);
+  }
+
+  /// 写一条控制指令
+  ///
+  /// 必须用「带响应」写：iOS 上「不带响应」写的完成回调依赖
+  /// peripheralIsReadyToSendWriteWithoutResponse，1 字节的小包几乎
+  /// 永远不会触发这个回调，Dart 侧只能一直等到超时，表现就是每次
+  /// 点按钮都「操作失败」。带响应写会走 didWriteValueForCharacteristic，
+  /// 能拿到真实的成功/失败。
+  Future<void> _writeCommand(BluetoothCharacteristic chr, int cmd) async {
+    await chr.write([cmd], withoutResponse: false, timeout: 4);
+  }
+
+  /// ATT 鉴权/加密类错误，重试没用，要重新连接重新加密
+  bool _isSecurityError(Object e) {
+    final s = e.toString().toLowerCase();
+    return s.contains('insufficient') ||
+        s.contains('authentication') ||
+        s.contains('encrypt') ||
+        s.contains('authoriz');
   }
 
   Future<void> _clearBond() async {
@@ -618,7 +649,7 @@ class _CarKeyHomePageState extends State<CarKeyHomePage>
 
     if (_state == ConnState.connected && _controlChar != null) {
       try {
-        await _controlChar!.write([_cmdClearBond], withoutResponse: true);
+        await _writeCommand(_controlChar!, _cmdClearBond);
         await Future.delayed(const Duration(milliseconds: 300));
       } catch (e) {
         debugPrint('发送清除指令失败: $e');
