@@ -361,31 +361,61 @@ class _CarKeyHomePageState extends State<CarKeyHomePage>
       await _saveBoundDevice(_device!.remoteId.str);
     }
 
-    _controlChar = null;
-    try {
-      final services = await _device!.discoverServices();
-      for (final service in services) {
-        if (service.uuid != _serviceUuid) continue;
-        for (final char in service.characteristics) {
-          if (char.uuid == _controlCharUuid) {
-            _controlChar = char;
-            debugPrint('已找到控制特征');
-          }
-        }
-      }
-    } catch (e) {
-      debugPrint('发现服务失败: $e');
-    }
-
     if (!mounted) return;
     setState(() {
       _state = ConnState.connected;
       _locked = false;                    // 连上后固件会自动解锁
       _statusText = '车辆已解锁';
-      _hint = _controlChar == null ? '未找到控制特征，手动按钮可能不可用' : null;
+      _hint = null;
     });
 
+    _controlChar = null;
+    final char = await _discoverControlChar();
+
+    if (!mounted) return;
+    if (char == null) {
+      /* 服务发现拿不到特征时，断开重连一次，通常第二次就正常 */
+      setState(() => _hint = '正在重新建立控制通道...');
+      _toast('连接不完整，正在自动重连');
+      try {
+        await _device?.disconnect();
+      } catch (_) {}
+      _scheduleReconnect();
+      return;
+    }
+
+    _controlChar = char;
+    if (mounted) setState(() => _hint = null);
     _readRssi();
+  }
+
+  /// 带重试地查找控制特征
+  ///
+  /// iOS 在加密握手尚未完成时调用 discoverServices 会返回空列表，
+  /// 表现为「连上了但找不到控制特征、按钮不可用」。
+  /// 这里先等加密完成，再多试几次。
+  Future<BluetoothCharacteristic?> _discoverControlChar() async {
+    for (var attempt = 1; attempt <= 5; attempt++) {
+      await Future.delayed(Duration(milliseconds: attempt == 1 ? 700 : 600));
+      if (!mounted || _device == null) return null;
+
+      try {
+        final services = await _device!.discoverServices();
+        debugPrint('服务发现第 $attempt 次：${services.length} 个服务');
+        for (final service in services) {
+          if (service.uuid != _serviceUuid) continue;
+          for (final c in service.characteristics) {
+            if (c.uuid == _controlCharUuid) {
+              debugPrint('已找到控制特征（第 $attempt 次）');
+              return c;
+            }
+          }
+        }
+      } catch (e) {
+        debugPrint('服务发现失败(第 $attempt 次): $e');
+      }
+    }
+    return null;
   }
 
   void _onDisconnected() {
