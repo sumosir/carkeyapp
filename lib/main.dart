@@ -43,7 +43,7 @@ class CarKeyApp extends StatelessWidget {
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
         colorScheme: ColorScheme.fromSeed(
-          seedColor: Colors.blue,
+          seedColor: const Color(0xFF3DDC97),
           brightness: Brightness.dark,
         ),
         useMaterial3: true,
@@ -63,7 +63,8 @@ class CarKeyHomePage extends StatefulWidget {
   State<CarKeyHomePage> createState() => _CarKeyHomePageState();
 }
 
-class _CarKeyHomePageState extends State<CarKeyHomePage> {
+class _CarKeyHomePageState extends State<CarKeyHomePage>
+    with SingleTickerProviderStateMixin {
   ConnState _state = ConnState.idle;
   BluetoothDevice? _device;
   BluetoothCharacteristic? _controlChar;
@@ -71,34 +72,32 @@ class _CarKeyHomePageState extends State<CarKeyHomePage> {
   String _statusText = '等待启动...';
   String? _hint;
   bool _isBusy = false;
-
-  /// 已绑定设备的唯一 ID（iOS 为 UUID，Android 为 MAC）
   String? _boundDeviceId;
-
-  /// 扫描到的所有设备
   final Map<String, ScanResult> _found = {};
-
-  /// 连接中标志，防止并发连接
   bool _connecting = false;
-
-  /// 连续重连失败次数
   int _reconnectAttempts = 0;
-
-  /// 本轮扫描是否至少看到过一次目标设备
   bool _sawTarget = false;
 
   Timer? _reconnectTimer;
   StreamSubscription<List<ScanResult>>? _scanSubscription;
   StreamSubscription<BluetoothConnectionState>? _connSubscription;
 
+  /// 扫描/连接时的呼吸动画
+  late final AnimationController _pulse;
+
   @override
   void initState() {
     super.initState();
+    _pulse = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 1600),
+    )..repeat(reverse: true);
     _initApp();
   }
 
   @override
   void dispose() {
+    _pulse.dispose();
     _reconnectTimer?.cancel();
     _scanSubscription?.cancel();
     _connSubscription?.cancel();
@@ -108,10 +107,8 @@ class _CarKeyHomePageState extends State<CarKeyHomePage> {
   // ==================== 初始化 ====================
 
   Future<void> _initApp() async {
-    // 1. 读取已绑定设备
     await _loadBoundDevice();
 
-    // 2. 申请权限
     final granted = await _requestPermissions();
     if (!granted) {
       if (mounted) {
@@ -119,8 +116,6 @@ class _CarKeyHomePageState extends State<CarKeyHomePage> {
       }
       return;
     }
-
-    // 3. 检查蓝牙并开始扫描
     await _ensureAdapterAndScan();
   }
 
@@ -150,7 +145,6 @@ class _CarKeyHomePageState extends State<CarKeyHomePage> {
     return scan.isGranted && connect.isGranted;
   }
 
-  /// 检查蓝牙开关状态，正常则开始扫描
   Future<void> _ensureAdapterAndScan() async {
     BluetoothAdapterState adapterState;
     try {
@@ -170,7 +164,7 @@ class _CarKeyHomePageState extends State<CarKeyHomePage> {
     }
     if (adapterState != BluetoothAdapterState.on) {
       setState(() {
-        _hint = '手机蓝牙未开启，请打开蓝牙后点「重新搜索」';
+        _hint = '手机蓝牙未开启，请打开蓝牙';
         _statusText = '蓝牙未开启';
       });
       return;
@@ -186,7 +180,6 @@ class _CarKeyHomePageState extends State<CarKeyHomePage> {
   String _normalize(String s) =>
       s.replaceAll(RegExp(r'[\s\u200B-\u200D\uFEFF]'), '').toLowerCase();
 
-  /// 名称匹配（platformName 在 iOS 上常为空，需同时看广播包名称）
   bool _isTarget(ScanResult r) {
     final target = _normalize(_targetDeviceName);
     return <String>[
@@ -195,7 +188,6 @@ class _CarKeyHomePageState extends State<CarKeyHomePage> {
     ].any((raw) {
       final n = _normalize(raw);
       if (n.isEmpty) return false;
-      // 双向包含：设备名可能被截断或带后缀
       return n == target ||
           n.contains(target) ||
           (n.length >= 4 && target.contains(n));
@@ -267,16 +259,14 @@ class _CarKeyHomePageState extends State<CarKeyHomePage> {
         if (_sawTarget) {
           _hint = '已发现 CarKey 但连接失败\n'
               '1. 确认没有其他手机连着它（开发板只支持 1 个连接）\n'
-              '2. 若换过固件，请点「清除配对记录」后重试';
+              '2. 若换过固件，请到设置里「清除配对记录」后重试';
         } else if (_found.isEmpty) {
           _hint = '没有扫描到任何蓝牙设备\n'
               '1. 确认手机蓝牙已开启\n'
-              '2. 确认开发板已通电\n'
-              '3. 如果安卓手机正连着开发板，请先断开它（开发板只支持 1 个连接）';
+              '2. 确认开发板已通电';
         } else {
           _hint = '已发现 ${_found.length} 个其他蓝牙设备，但没有 CarKey\n'
-              '开发板可能已被其他手机占用连接（此时会停止广播）\n'
-              '请把安卓手机的蓝牙关掉后再试';
+              '开发板可能已被其他手机占用连接（此时会停止广播）';
         }
       });
     }
@@ -316,7 +306,6 @@ class _CarKeyHomePageState extends State<CarKeyHomePage> {
         }
       });
 
-      // 先用普通方式连接（快）；失败再用 autoConnect（iOS 后台更可靠）
       bool ok = await _tryConnect(device, autoConnect);
       if (!ok) {
         if (mounted) setState(() => _statusText = '连接失败，重试中...');
@@ -344,7 +333,6 @@ class _CarKeyHomePageState extends State<CarKeyHomePage> {
     }
   }
 
-  /// 尝试连接一次，返回是否成功
   Future<bool> _tryConnect(BluetoothDevice device, bool autoConnect) async {
     try {
       await device.connect(
@@ -358,7 +346,6 @@ class _CarKeyHomePageState extends State<CarKeyHomePage> {
     }
   }
 
-  /// 连接失败提示
   Future<void> _showConnectFailedDialog() async {
     if (!mounted) return;
     await showDialog<void>(
@@ -367,7 +354,7 @@ class _CarKeyHomePageState extends State<CarKeyHomePage> {
         title: const Text('连接失败'),
         content: const Text(
           '1. 确认没有其他手机连着 CarKey（开发板只支持 1 个连接）\n\n'
-          '2. 若换过固件，点「清除配对记录」，然后重新搜索\n\n'
+          '2. 若换过固件，到设置里点「清除配对记录」，然后重新搜索\n\n'
           '3. 关掉手机蓝牙再打开，重新搜索',
         ),
         actions: [
@@ -385,12 +372,10 @@ class _CarKeyHomePageState extends State<CarKeyHomePage> {
     _reconnectTimer?.cancel();
     _reconnectAttempts = 0;
 
-    // 记住这台设备，下次自动连接
     if (_device != null) {
       await _saveBoundDevice(_device!.remoteId.str);
     }
 
-    // 发现服务，拿到控制特征
     _controlChar = null;
     try {
       final services = await _device!.discoverServices();
@@ -410,7 +395,7 @@ class _CarKeyHomePageState extends State<CarKeyHomePage> {
     if (!mounted) return;
     setState(() {
       _state = ConnState.connected;
-      _statusText = '已连接 — 靠近自动解锁';
+      _statusText = '车辆已解锁';
       _hint = _controlChar == null ? '未找到控制特征，手动按钮可能不可用' : null;
     });
 
@@ -422,13 +407,12 @@ class _CarKeyHomePageState extends State<CarKeyHomePage> {
     if (!mounted) return;
     setState(() {
       _state = ConnState.disconnected;
-      _statusText = '已断开 — 远离自动上锁';
+      _statusText = '已断开，车辆上锁';
       _rssi = null;
     });
     _scheduleReconnect();
   }
 
-  /// 断线重连：连续失败 3 次后回到扫描
   void _scheduleReconnect() {
     _reconnectTimer?.cancel();
     _reconnectTimer = Timer(
@@ -444,7 +428,6 @@ class _CarKeyHomePageState extends State<CarKeyHomePage> {
         }
 
         if (_device != null) {
-          // autoConnect=true：iOS 会在后台持续尝试，回到范围内自动连上
           await _connectToDevice(_device!, autoConnect: true);
         } else {
           await _startScan();
@@ -475,8 +458,9 @@ class _CarKeyHomePageState extends State<CarKeyHomePage> {
     try {
       await _controlChar!.write([cmd], withoutResponse: true);
       if (mounted) {
-        setState(() => _statusText =
-            cmd == _cmdUnlock ? '手动解锁' : '手动上锁');
+        setState(() {
+          _statusText = cmd == _cmdUnlock ? '已手动解锁' : '已手动上锁';
+        });
       }
     } catch (e) {
       _toast('操作失败: $e');
@@ -485,7 +469,6 @@ class _CarKeyHomePageState extends State<CarKeyHomePage> {
     }
   }
 
-  /// 清除开发板上的配对记录，并解除 App 的绑定
   Future<void> _clearBond() async {
     final ok = await showDialog<bool>(
       context: context,
@@ -502,6 +485,7 @@ class _CarKeyHomePageState extends State<CarKeyHomePage> {
           ),
           TextButton(
             onPressed: () => Navigator.pop(ctx, true),
+            style: TextButton.styleFrom(foregroundColor: Colors.redAccent),
             child: const Text('确认清除'),
           ),
         ],
@@ -509,7 +493,6 @@ class _CarKeyHomePageState extends State<CarKeyHomePage> {
     );
     if (ok != true) return;
 
-    // 1. 通知开发板清除绑定
     if (_state == ConnState.connected && _controlChar != null) {
       try {
         await _controlChar!.write([_cmdClearBond], withoutResponse: true);
@@ -519,300 +502,638 @@ class _CarKeyHomePageState extends State<CarKeyHomePage> {
       }
     }
 
-    // 2. 清除本地绑定
     try {
       final prefs = await SharedPreferences.getInstance();
       await prefs.remove(_prefBoundDevice);
     } catch (_) {}
     _boundDeviceId = null;
 
-    // 3. 断开并重新扫描
     try {
       await _device?.disconnect();
     } catch (_) {}
     _device = null;
     _controlChar = null;
     _reconnectAttempts = 0;
-    await _manualRescan();
 
+    await _restartScan();
     _toast('已清除配对记录，请重新配对（配对码 299450）');
   }
 
+  /// 重新搜索（已连接时会二次确认，避免误触断开）
   Future<void> _manualRescan() async {
+    if (_state == ConnState.connected) {
+      final ok = await showDialog<bool>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: const Text('重新搜索'),
+          content: const Text('当前已连接，重新搜索会先断开连接（车辆会上锁）。确定继续？'),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('取消'),
+            ),
+            TextButton(
+              onPressed: () => Navigator.pop(ctx, true),
+              child: const Text('继续'),
+            ),
+          ],
+        ),
+      );
+      if (ok != true) return;
+    }
+    await _restartScan();
+  }
+
+  Future<void> _restartScan() async {
     _reconnectTimer?.cancel();
     await _scanSubscription?.cancel();
     _scanSubscription = null;
     try {
       await FlutterBluePlus.stopScan();
     } catch (_) {}
+    try {
+      await _device?.disconnect();
+    } catch (_) {}
     _controlChar = null;
     _device = null;
+    _reconnectAttempts = 0;
     if (mounted) setState(() => _state = ConnState.idle);
     await _ensureAdapterAndScan();
   }
 
   void _toast(String msg) {
     if (!mounted) return;
-    ScaffoldMessenger.of(context)
-        .showSnackBar(SnackBar(content: Text(msg)));
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
   }
 
-  // ==================== UI ====================
+  // ==================== 设置页 ====================
 
-  @override
-  Widget build(BuildContext context) {
-    final isConnected = _state == ConnState.connected;
-
-    return Scaffold(
-      body: Container(
-        decoration: BoxDecoration(
-          gradient: LinearGradient(
-            begin: Alignment.topCenter,
-            end: Alignment.bottomCenter,
-            colors: isConnected
-                ? [Colors.green.shade900, Colors.black]
-                : [Colors.blueGrey.shade900, Colors.black],
-          ),
-        ),
-        child: SafeArea(
-          child: Center(
-            child: SingleChildScrollView(
-              padding: const EdgeInsets.all(24),
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Icon(
-                    isConnected ? Icons.lock_open : Icons.lock,
-                    size: 90,
-                    color: isConnected ? Colors.green : Colors.white70,
-                  ),
-                  const SizedBox(height: 20),
-                  Text(
-                    _statusText,
-                    style: const TextStyle(
-                      fontSize: 20,
-                      fontWeight: FontWeight.bold,
-                      color: Colors.white,
-                    ),
-                    textAlign: TextAlign.center,
-                  ),
-                  if (_rssi != null) ...[
-                    const SizedBox(height: 10),
-                    Row(
-                      mainAxisAlignment: MainAxisAlignment.center,
-                      children: [
-                        const Icon(Icons.signal_cellular_alt,
-                            color: Colors.white70, size: 18),
-                        const SizedBox(width: 8),
-                        Text('信号: $_rssi dBm',
-                            style: const TextStyle(color: Colors.white70)),
-                      ],
-                    ),
-                  ],
-                  if (_boundDeviceId != null) ...[
-                    const SizedBox(height: 8),
-                    Text(
-                      '已绑定：${_boundDeviceId!.length > 20 ? "${_boundDeviceId!.substring(0, 8)}…" : _boundDeviceId}',
-                      style: const TextStyle(color: Colors.white38, fontSize: 12),
-                    ),
-                  ],
-                  if (_hint != null) ...[
-                    const SizedBox(height: 16),
-                    Container(
-                      width: double.infinity,
-                      padding: const EdgeInsets.all(12),
-                      decoration: BoxDecoration(
-                        color: Colors.orange.withValues(alpha: 0.15),
-                        borderRadius: BorderRadius.circular(10),
-                        border: Border.all(
-                            color: Colors.orange.withValues(alpha: 0.4)),
-                      ),
-                      child: Text(
-                        _hint!,
-                        style: const TextStyle(
-                            color: Colors.orangeAccent, fontSize: 13),
-                      ),
-                    ),
-                  ],
-                  const SizedBox(height: 28),
-                  Row(
-                    mainAxisAlignment: MainAxisAlignment.center,
-                    children: [
-                      _buildControlButton(
-                        icon: Icons.lock_open,
-                        label: '解锁',
-                        color: Colors.green,
-                        onPressed:
-                            _isBusy ? null : () => _sendCommand(_cmdUnlock),
-                      ),
-                      const SizedBox(width: 40),
-                      _buildControlButton(
-                        icon: Icons.lock,
-                        label: '上锁',
-                        color: Colors.red,
-                        onPressed:
-                            _isBusy ? null : () => _sendCommand(_cmdLock),
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 24),
-                  _buildStatusIndicator(),
-                  const SizedBox(height: 24),
-                  SizedBox(
-                    width: double.infinity,
-                    child: OutlinedButton.icon(
-                      onPressed: _manualRescan,
-                      icon: const Icon(Icons.refresh),
-                      label: const Text('重新搜索'),
-                      style: OutlinedButton.styleFrom(
-                        padding: const EdgeInsets.symmetric(vertical: 14),
-                        foregroundColor: Colors.white70,
-                        side: const BorderSide(color: Colors.white24),
-                      ),
-                    ),
-                  ),
-                  const SizedBox(height: 10),
-                  SizedBox(
-                    width: double.infinity,
-                    child: TextButton.icon(
-                      onPressed: _clearBond,
-                      icon: const Icon(Icons.link_off, size: 18),
-                      label: const Text('清除配对记录'),
-                      style: TextButton.styleFrom(
-                        foregroundColor: Colors.white38,
-                      ),
-                    ),
-                  ),
-                  if (_found.isNotEmpty) ...[
-                    const SizedBox(height: 16),
-                    Align(
-                      alignment: Alignment.centerLeft,
-                      child: Text(
-                        '附近蓝牙设备 (${_found.length})',
-                        style:
-                            const TextStyle(color: Colors.white54, fontSize: 13),
-                      ),
-                    ),
-                    const SizedBox(height: 8),
-                    ..._buildDeviceList(),
-                  ],
-                ],
-              ),
-            ),
+  Future<void> _openSettings() async {
+    await Navigator.of(context).push(
+      PageRouteBuilder<void>(
+        transitionDuration: const Duration(milliseconds: 260),
+        pageBuilder: (_, animation, _) => FadeTransition(
+          opacity: animation,
+          child: SettingsPage(
+            devices: _found.values.toList()
+              ..sort((a, b) => b.rssi.compareTo(a.rssi)),
+            boundDeviceId: _boundDeviceId,
+            isConnected: _state == ConnState.connected,
+            isTarget: _isTarget,
+            onRescan: _manualRescan,
+            onClearBond: _clearBond,
+            onConnect: (device) => _connectToDevice(device),
           ),
         ),
       ),
     );
   }
 
-  List<Widget> _buildDeviceList() {
-    final list = _found.values.toList()
-      ..sort((a, b) => b.rssi.compareTo(a.rssi));
+  // ==================== UI ====================
 
-    return list.take(8).map((r) {
-      final name = r.device.platformName.isNotEmpty
-          ? r.device.platformName
-          : (r.advertisementData.advName.isNotEmpty
-              ? r.advertisementData.advName
-              : '(无名称)');
-      final isBound = _boundDeviceId != null &&
-          r.device.remoteId.str == _boundDeviceId;
-      final isTarget = _isTarget(r);
-
-      return Card(
-        color: (isBound || isTarget)
-            ? Colors.green.withValues(alpha: 0.2)
-            : Colors.white10,
-        margin: const EdgeInsets.only(bottom: 6),
-        child: ListTile(
-          dense: true,
-          title: Text(
-            name,
-            style: TextStyle(
-              color: (isBound || isTarget)
-                  ? Colors.greenAccent
-                  : Colors.white,
-              fontSize: 14,
-            ),
-          ),
-          subtitle: Text(
-            '${r.device.remoteId.str}   ${r.rssi} dBm',
-            style: const TextStyle(color: Colors.white38, fontSize: 11),
-          ),
-          trailing: const Icon(Icons.chevron_right,
-              color: Colors.white38, size: 18),
-          onTap: () => _connectToDevice(r.device),
-        ),
-      );
-    }).toList();
+  /// 根据状态返回背景渐变色
+  List<Color> get _bgColors {
+    switch (_state) {
+      case ConnState.connected:
+        return const [Color(0xFF0E7C5A), Color(0xFF052B22), Color(0xFF000000)];
+      case ConnState.connecting:
+      case ConnState.scanning:
+        return const [Color(0xFF14406E), Color(0xFF071B2E), Color(0xFF000000)];
+      case ConnState.disconnected:
+        return const [Color(0xFF7A1F1F), Color(0xFF2A0A0A), Color(0xFF000000)];
+      default:
+        return const [Color(0xFF2A2F36), Color(0xFF101316), Color(0xFF000000)];
+    }
   }
 
-  Widget _buildControlButton({
-    required IconData icon,
-    required String label,
-    required Color color,
-    required VoidCallback? onPressed,
-  }) {
-    return Column(
-      children: [
-        SizedBox(
-          width: 78,
-          height: 78,
-          child: ElevatedButton(
-            onPressed: onPressed,
-            style: ElevatedButton.styleFrom(
-              backgroundColor: color,
-              shape: const CircleBorder(),
-              padding: EdgeInsets.zero,
-            ),
-            child: Icon(icon, size: 34, color: Colors.white),
+  /// 主色：解锁绿 / 上锁红 / 过程蓝
+  Color get _accent {
+    switch (_state) {
+      case ConnState.connected:
+        return const Color(0xFF3DDC97);
+      case ConnState.scanning:
+      case ConnState.connecting:
+        return const Color(0xFF4EA8FF);
+      case ConnState.disconnected:
+        return const Color(0xFFFF6B6B);
+      default:
+        return Colors.white70;
+    }
+  }
+
+  bool get _isConnected => _state == ConnState.connected;
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      body: AnimatedContainer(
+        duration: const Duration(milliseconds: 700),
+        curve: Curves.easeInOut,
+        decoration: BoxDecoration(
+          gradient: LinearGradient(
+            begin: Alignment.topCenter,
+            end: Alignment.bottomCenter,
+            colors: _bgColors,
           ),
         ),
-        const SizedBox(height: 8),
-        Text(label, style: const TextStyle(color: Colors.white)),
-      ],
+        child: SafeArea(
+          child: Column(
+            children: [
+              // 顶部栏
+              Padding(
+                padding: const EdgeInsets.fromLTRB(24, 12, 12, 0),
+                child: Row(
+                  children: [
+                    const Text(
+                      '车钥匙',
+                      style: TextStyle(
+                        fontSize: 20,
+                        fontWeight: FontWeight.w600,
+                        color: Colors.white,
+                        letterSpacing: 1,
+                      ),
+                    ),
+                    const Spacer(),
+                    IconButton(
+                      tooltip: '设置',
+                      onPressed: _openSettings,
+                      icon: const Icon(Icons.settings_outlined,
+                          color: Colors.white70, size: 24),
+                    ),
+                  ],
+                ),
+              ),
+
+              // 中间状态区
+              Expanded(
+                child: Center(
+                  child: SingleChildScrollView(
+                    padding: const EdgeInsets.symmetric(horizontal: 24),
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        _buildLockVisual(),
+                        const SizedBox(height: 24),
+                        AnimatedDefaultTextStyle(
+                          duration: const Duration(milliseconds: 400),
+                          style: TextStyle(
+                            fontSize: 26,
+                            fontWeight: FontWeight.bold,
+                            color: Colors.white,
+                            letterSpacing: 1,
+                            shadows: [
+                              Shadow(color: _accent.withValues(alpha: 0.6),
+                                  blurRadius: 18),
+                            ],
+                          ),
+                          child: Text(_statusText, textAlign: TextAlign.center),
+                        ),
+                        const SizedBox(height: 10),
+                        Text(
+                          _subText,
+                          style: TextStyle(
+                            fontSize: 13,
+                            color: Colors.white.withValues(alpha: 0.55),
+                          ),
+                        ),
+                        if (_rssi != null) ...[
+                          const SizedBox(height: 14),
+                          _buildRssiBadge(),
+                        ],
+                        if (_hint != null) ...[
+                          const SizedBox(height: 18),
+                          _buildHintBox(),
+                        ],
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+
+              // 底部大按钮
+              Padding(
+                padding: const EdgeInsets.fromLTRB(28, 0, 28, 32),
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: _BigActionButton(
+                        label: '解锁',
+                        icon: Icons.lock_open_rounded,
+                        color: const Color(0xFF2FBF71),
+                        enabled: _isConnected && !_isBusy,
+                        onTap: () => _sendCommand(_cmdUnlock),
+                      ),
+                    ),
+                    const SizedBox(width: 18),
+                    Expanded(
+                      child: _BigActionButton(
+                        label: '上锁',
+                        icon: Icons.lock_rounded,
+                        color: const Color(0xFFE04A4A),
+                        enabled: _isConnected && !_isBusy,
+                        onTap: () => _sendCommand(_cmdLock),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
     );
   }
 
-  Widget _buildStatusIndicator() {
-    Color color;
-    String text;
+  String get _subText {
     switch (_state) {
       case ConnState.connected:
-        color = Colors.green;
-        text = '已连接';
-        break;
+        return '靠近自动解锁 · 离开自动上锁';
       case ConnState.connecting:
-        color = Colors.orange;
-        text = '连接中';
-        break;
+        return '正在建立连接...';
       case ConnState.scanning:
-        color = Colors.blue;
-        text = '搜索中';
-        break;
+        return '保持手机蓝牙开启，靠近开发板';
       case ConnState.disconnected:
-        color = Colors.red;
-        text = '已断开';
-        break;
+        return '等待自动重连...';
       default:
-        color = Colors.grey;
-        text = '待机';
+        return '下拉刷新或到设置里重新搜索';
     }
-    return Row(
-      mainAxisAlignment: MainAxisAlignment.center,
-      children: [
-        Container(
-          width: 12,
-          height: 12,
+  }
+
+  /// 车锁图标 + 呼吸光晕
+  Widget _buildLockVisual() {
+    final busy = _state == ConnState.scanning || _state == ConnState.connecting;
+
+    return AnimatedBuilder(
+      animation: _pulse,
+      builder: (context, child) {
+        final t = busy ? _pulse.value : 0.0;
+        final scale = 1.0 + t * 0.06;
+        final glow = busy ? 0.25 + t * 0.35 : 0.35;
+
+        return Container(
+          width: 170,
+          height: 170,
           decoration: BoxDecoration(
-            color: color,
             shape: BoxShape.circle,
-            boxShadow: [BoxShadow(color: color, blurRadius: 8)],
+            boxShadow: [
+              BoxShadow(
+                color: _accent.withValues(alpha: glow * 0.45),
+                blurRadius: 60 + t * 40,
+                spreadRadius: 6,
+              ),
+            ],
+          ),
+          child: Center(
+            child: Transform.scale(
+              scale: scale,
+              child: child,
+            ),
+          ),
+        );
+      },
+      child: AnimatedSwitcher(
+        duration: const Duration(milliseconds: 450),
+        transitionBuilder: (child, animation) => ScaleTransition(
+          scale: CurvedAnimation(parent: animation, curve: Curves.easeOutBack),
+          child: FadeTransition(opacity: animation, child: child),
+        ),
+        child: Icon(
+          _isConnected ? Icons.lock_open_rounded : Icons.lock_rounded,
+          key: ValueKey(_isConnected),
+          size: 110,
+          color: _accent,
+        ),
+      ),
+    );
+  }
+
+  Widget _buildRssiBadge() {
+    final strong = (_rssi ?? -100) > -70;
+    final color = strong ? const Color(0xFF3DDC97) : Colors.orangeAccent;
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 7),
+      decoration: BoxDecoration(
+        color: Colors.white.withValues(alpha: 0.08),
+        borderRadius: BorderRadius.circular(30),
+        border: Border.all(color: Colors.white.withValues(alpha: 0.12)),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(Icons.signal_cellular_alt_rounded, color: color, size: 16),
+          const SizedBox(width: 6),
+          Text(
+            '$_rssi dBm',
+            style: TextStyle(color: color, fontSize: 12),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildHintBox() {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: Colors.orange.withValues(alpha: 0.12),
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: Colors.orange.withValues(alpha: 0.35)),
+      ),
+      child: Text(
+        _hint!,
+        style: const TextStyle(color: Colors.orangeAccent, fontSize: 12.5, height: 1.5),
+      ),
+    );
+  }
+}
+
+// ============================================================================
+//                            底部大按钮（带按压缩放）
+// ============================================================================
+
+class _BigActionButton extends StatefulWidget {
+  final String label;
+  final IconData icon;
+  final Color color;
+  final bool enabled;
+  final VoidCallback onTap;
+
+  const _BigActionButton({
+    required this.label,
+    required this.icon,
+    required this.color,
+    required this.enabled,
+    required this.onTap,
+  });
+
+  @override
+  State<_BigActionButton> createState() => _BigActionButtonState();
+}
+
+class _BigActionButtonState extends State<_BigActionButton> {
+  bool _pressed = false;
+
+  @override
+  Widget build(BuildContext context) {
+    final c = widget.enabled
+        ? widget.color
+        : widget.color.withValues(alpha: 0.28);
+
+    return AnimatedScale(
+      scale: _pressed ? 0.94 : 1.0,
+      duration: const Duration(milliseconds: 110),
+      child: GestureDetector(
+        onTapDown: widget.enabled ? (_) => setState(() => _pressed = true) : null,
+        onTapCancel: () => setState(() => _pressed = false),
+        onTapUp: widget.enabled
+            ? (_) {
+                setState(() => _pressed = false);
+                widget.onTap();
+              }
+            : null,
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 350),
+          height: 96,
+          decoration: BoxDecoration(
+            color: c.withValues(alpha: 0.16),
+            borderRadius: BorderRadius.circular(26),
+            border: Border.all(color: c.withValues(alpha: 0.55), width: 1.6),
+            boxShadow: widget.enabled
+                ? [
+                    BoxShadow(
+                      color: c.withValues(alpha: 0.35),
+                      blurRadius: 26,
+                      spreadRadius: 1,
+                    ),
+                  ]
+                : [],
+          ),
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Icon(widget.icon, color: c, size: 34),
+              const SizedBox(height: 8),
+              Text(
+                widget.label,
+                style: TextStyle(
+                  color: c,
+                  fontSize: 15,
+                  fontWeight: FontWeight.w600,
+                  letterSpacing: 2,
+                ),
+              ),
+            ],
           ),
         ),
-        const SizedBox(width: 8),
-        Text(text, style: const TextStyle(color: Colors.white70)),
-      ],
+      ),
+    );
+  }
+}
+
+// ============================================================================
+//                              设置页
+// ============================================================================
+
+class SettingsPage extends StatelessWidget {
+  final List<ScanResult> devices;
+  final String? boundDeviceId;
+  final bool isConnected;
+  final bool Function(ScanResult) isTarget;
+  final Future<void> Function() onRescan;
+  final Future<void> Function() onClearBond;
+  final void Function(BluetoothDevice) onConnect;
+
+  const SettingsPage({
+    super.key,
+    required this.devices,
+    required this.boundDeviceId,
+    required this.isConnected,
+    required this.isTarget,
+    required this.onRescan,
+    required this.onClearBond,
+    required this.onConnect,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: const Color(0xFF0B0E11),
+      appBar: AppBar(
+        backgroundColor: Colors.transparent,
+        elevation: 0,
+        title: const Text('设置'),
+        leading: IconButton(
+          icon: const Icon(Icons.arrow_back_ios_new, size: 18),
+          onPressed: () => Navigator.pop(context),
+        ),
+      ),
+      body: ListView(
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+        children: [
+          _sectionLabel('设备'),
+          _card([
+            _tile(
+              icon: Icons.refresh_rounded,
+              title: '重新搜索设备',
+              subtitle: isConnected ? '当前已连接，重新搜索会先断开' : '扫描附近的 CarKey',
+              onTap: () async {
+                Navigator.pop(context);
+                await onRescan();
+              },
+            ),
+            _divider(),
+            _tile(
+              icon: Icons.link_off_rounded,
+              title: '清除配对记录',
+              subtitle: '删除开发板绑定，需重新输入配对码',
+              color: Colors.redAccent,
+              onTap: () async {
+                Navigator.pop(context);
+                await onClearBond();
+              },
+            ),
+          ]),
+
+          const SizedBox(height: 20),
+          _sectionLabel('连接信息'),
+          _card([
+            _tile(
+              icon: Icons.tag_rounded,
+              title: '设备名称',
+              subtitle: _targetDeviceName,
+              dense: true,
+            ),
+            _divider(),
+            _tile(
+              icon: Icons.password_rounded,
+              title: '配对码',
+              subtitle: '299450',
+              dense: true,
+            ),
+            _divider(),
+            _tile(
+              icon: Icons.bluetooth_connected_rounded,
+              title: '已绑定设备',
+              subtitle: boundDeviceId ??
+                  '未绑定（连接成功后自动绑定这台手机）',
+              dense: true,
+            ),
+          ]),
+
+          const SizedBox(height: 20),
+          _sectionLabel('附近的蓝牙设备 (${devices.length})'),
+          if (devices.isEmpty)
+            _card([
+              const Padding(
+                padding: EdgeInsets.all(18),
+                child: Text(
+                  '暂无扫描结果\n回到主页等待自动搜索',
+                  style: TextStyle(color: Colors.white38, fontSize: 13),
+                ),
+              ),
+            ])
+          else
+            _card(
+              devices.take(12).map((r) {
+                final name = r.device.platformName.isNotEmpty
+                    ? r.device.platformName
+                    : (r.advertisementData.advName.isNotEmpty
+                        ? r.advertisementData.advName
+                        : '(无名称)');
+                final target = isTarget(r);
+                final bound = boundDeviceId != null &&
+                    r.device.remoteId.str == boundDeviceId;
+
+                return Column(
+                  children: [
+                    ListTile(
+                      title: Text(
+                        name,
+                        style: TextStyle(
+                          color: (target || bound)
+                              ? const Color(0xFF3DDC97)
+                              : Colors.white,
+                          fontSize: 14.5,
+                        ),
+                      ),
+                      subtitle: Text(
+                        '${r.device.remoteId.str}   ${r.rssi} dBm',
+                        style: const TextStyle(
+                            color: Colors.white30, fontSize: 11),
+                      ),
+                      trailing: (target || bound)
+                          ? const Icon(Icons.bluetooth_searching_rounded,
+                              size: 18, color: Color(0xFF3DDC97))
+                          : null,
+                      onTap: () {
+                        Navigator.pop(context);
+                        onConnect(r.device);
+                      },
+                    ),
+                  ],
+                );
+              }).toList(),
+            ),
+          const SizedBox(height: 32),
+        ],
+      ),
+    );
+  }
+
+  Widget _sectionLabel(String text) => Padding(
+        padding: const EdgeInsets.fromLTRB(8, 4, 8, 8),
+        child: Text(
+          text,
+          style: const TextStyle(
+            color: Colors.white38,
+            fontSize: 12,
+            letterSpacing: 1,
+          ),
+        ),
+      );
+
+  Widget _card(List<Widget> children) => Container(
+        decoration: BoxDecoration(
+          color: const Color(0xFF15191D),
+          borderRadius: BorderRadius.circular(16),
+        ),
+        child: Column(children: children),
+      );
+
+  Widget _divider() => Divider(
+        height: 1,
+        thickness: 1,
+        color: Colors.white.withValues(alpha: 0.05),
+      );
+
+  Widget _tile({
+    required IconData icon,
+    required String title,
+    required String subtitle,
+    Color? color,
+    VoidCallback? onTap,
+    bool dense = false,
+  }) {
+    return ListTile(
+      dense: dense,
+      onTap: onTap,
+      leading: Icon(icon, color: color ?? Colors.white60, size: 20),
+      title: Text(
+        title,
+        style: TextStyle(color: color ?? Colors.white, fontSize: 14.5),
+      ),
+      subtitle: Text(
+        subtitle,
+        style: TextStyle(
+          color: Colors.white.withValues(alpha: 0.35),
+          fontSize: 11.5,
+        ),
+      ),
+      trailing: onTap == null
+          ? null
+          : const Icon(Icons.chevron_right_rounded,
+              color: Colors.white24, size: 20),
     );
   }
 }
