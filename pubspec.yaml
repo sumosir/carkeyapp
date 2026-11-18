@@ -39,6 +39,8 @@ dependencies:
   flutter_blue_plus: ^1.35.0
   # 运行时权限（Android 12+）
   permission_handler: ^11.3.1
+  # 本地存储（记住已绑定设备，实现自动连接）
+  shared_preferences: ^2.3.4
 
 dev_dependencies:
   flutter_test:
