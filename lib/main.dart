@@ -62,9 +62,13 @@ class _CarKeyHomePageState extends State<CarKeyHomePage>
   ConnState _state = ConnState.idle;
   BluetoothDevice? _device;
   BluetoothCharacteristic? _controlChar;
+  /// 首次发现成功后缓存的特征对象，重连时直接复用
+  BluetoothCharacteristic? _cachedChar;
   int? _rssi;
   String _statusText = '等待启动...';
   String? _hint;
+  /// 服务发现诊断信息（排查用，正常时为空）
+  String? _diag;
   bool _isBusy = false;
   String? _boundDeviceId;
   final Map<String, ScanResult> _found = {};
@@ -369,11 +373,16 @@ class _CarKeyHomePageState extends State<CarKeyHomePage>
       _hint = null;
     });
 
-    _controlChar = null;
-    final char = await _discoverControlChar();
+    /* iOS 在重连后再次 discoverServices 往往不会再回调，因此优先复用
+     * 首次发现得到的特征对象；只有缓存为空时才重新发现 */
+    _controlChar = _cachedChar;
+    if (_controlChar == null) {
+      _controlChar = await _discoverControlChar();
+      _cachedChar = _controlChar;
+    }
 
     if (!mounted) return;
-    if (char == null) {
+    if (_controlChar == null) {
       /* 服务发现拿不到特征时，断开重连一次，通常第二次就正常 */
       setState(() => _hint = '正在重新建立控制通道...');
       _toast('连接不完整，正在自动重连');
@@ -384,7 +393,6 @@ class _CarKeyHomePageState extends State<CarKeyHomePage>
       return;
     }
 
-    _controlChar = char;
     if (mounted) setState(() => _hint = null);
     _readRssi();
   }
@@ -395,24 +403,34 @@ class _CarKeyHomePageState extends State<CarKeyHomePage>
   /// 表现为「连上了但找不到控制特征、按钮不可用」。
   /// 这里先等加密完成，再多试几次。
   Future<BluetoothCharacteristic?> _discoverControlChar() async {
-    for (var attempt = 1; attempt <= 5; attempt++) {
+    for (var attempt = 1; attempt <= 3; attempt++) {
       await Future.delayed(Duration(milliseconds: attempt == 1 ? 700 : 600));
       if (!mounted || _device == null) return null;
 
       try {
-        final services = await _device!.discoverServices();
+        final services = await _device!.discoverServices(
+          timeout: 6,
+          subscribeToServicesChanged: false,
+        );
         debugPrint('服务发现第 $attempt 次：${services.length} 个服务');
+        if (mounted) {
+          setState(() => _diag = '第 $attempt 次发现：${services.length} 个服务');
+        }
         for (final service in services) {
           if (service.uuid != _serviceUuid) continue;
           for (final c in service.characteristics) {
             if (c.uuid == _controlCharUuid) {
               debugPrint('已找到控制特征（第 $attempt 次）');
+              if (mounted) setState(() => _diag = null);
               return c;
             }
           }
         }
       } catch (e) {
         debugPrint('服务发现失败(第 $attempt 次): $e');
+        if (mounted) {
+          setState(() => _diag = '第 $attempt 次失败：$e');
+        }
       }
     }
     return null;
@@ -473,7 +491,15 @@ class _CarKeyHomePageState extends State<CarKeyHomePage>
         });
       }
     } catch (e) {
-      _toast('操作失败: $e');
+      /* 特征对象可能随连接失效，清掉缓存后重连一次 */
+      debugPrint('写入失败: $e');
+      _cachedChar = null;
+      _controlChar = null;
+      _toast('操作失败，正在重新连接...');
+      try {
+        await _device?.disconnect();
+      } catch (_) {}
+      _scheduleReconnect();
     } finally {
       if (mounted) setState(() => _isBusy = false);
     }
@@ -523,6 +549,7 @@ class _CarKeyHomePageState extends State<CarKeyHomePage>
     } catch (_) {}
     _device = null;
     _controlChar = null;
+    _cachedChar = null;
     _locked = true;
 
     await _restartScan();
@@ -873,9 +900,24 @@ class _CarKeyHomePageState extends State<CarKeyHomePage>
         borderRadius: BorderRadius.circular(14),
         border: Border.all(color: Colors.orange.withValues(alpha: 0.35)),
       ),
-      child: Text(
-        _hint!,
-        style: const TextStyle(color: Colors.orangeAccent, fontSize: 12.5, height: 1.5),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            _hint!,
+            style: const TextStyle(color: Colors.orangeAccent, fontSize: 12.5, height: 1.5),
+          ),
+          if (_diag != null) ...[
+            const SizedBox(height: 6),
+            Text(
+              _diag!,
+              style: TextStyle(
+                color: Colors.white.withValues(alpha: 0.55),
+                fontSize: 11,
+              ),
+            ),
+          ],
+        ],
       ),
     );
   }
